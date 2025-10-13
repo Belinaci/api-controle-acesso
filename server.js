@@ -3,7 +3,7 @@ const app = express();
 
 // ===== CONFIGURAÇÕES =====
 const TOKEN_VALIDO = 'testeAPI';
-const PORTA = 3000;
+const PORTA = process.env.PORT || 3000;
 const HOST = '0.0.0.0'; 
 
 // ===== ROTA PRINCIPAL =====
