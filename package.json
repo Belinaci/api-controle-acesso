@@ -1,11 +1,18 @@
 {
-  "name": "api-controle-acesso",
+  "name": "fechadura-api",
   "version": "1.0.0",
+  "description": "API HTTPS para controle de fechadura com atualização automática de certificado",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "cert:renew": "node cert_renew.js"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "node-forge": "^1.3.2"
   }
 }
