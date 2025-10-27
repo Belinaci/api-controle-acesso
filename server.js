@@ -1,48 +1,122 @@
-import fs from "fs";
-import https from "https";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import jwt from "jsonwebtoken";
-import forge from "node-forge";
 import dotenv from "dotenv";
+import https from "https";
+import tls from "tls";
 
 dotenv.config();
 
 const app = express();
+
+// ----------------------------------------------------------------------
+// 🔧 MIDDLEWARES
+// ----------------------------------------------------------------------
 app.use(cors());
 app.use(helmet());
 app.use(express.json());
 
-// ----------------------------------------------------------------------
-// 🔐 CONFIGURAÇÕES DE CERTIFICADO (gerenciado automaticamente)
-// ----------------------------------------------------------------------
-const CERT_PATH = "./certs/fullchain.pem";
-const KEY_PATH = "./certs/privkey.pem";
+// Trust proxy (importante para Render)
+app.set('trust proxy', 1);
 
-if (!fs.existsSync(CERT_PATH) || !fs.existsSync(KEY_PATH)) {
-  console.error("❌ Certificado SSL não encontrado. Gere usando Let's Encrypt (certbot).");
-  process.exit(1);
+// ----------------------------------------------------------------------
+// 🔐 FUNÇÃO: Obter certificado do próprio servidor
+// ----------------------------------------------------------------------
+function obterCertificadoServidor() {
+  return new Promise((resolve, reject) => {
+    const hostname = process.env.RENDER_EXTERNAL_URL 
+      ? new URL(process.env.RENDER_EXTERNAL_URL).hostname 
+      : 'localhost';
+    
+    const options = {
+      host: hostname,
+      port: 443,
+      method: 'GET',
+      rejectUnauthorized: false,
+      agent: false
+    };
+
+    const req = https.request(options, (res) => {
+      const cert = res.socket.getPeerCertificate(true);
+      
+      if (!cert || Object.keys(cert).length === 0) {
+        reject(new Error('Certificado não encontrado'));
+        return;
+      }
+
+      // Extrai PEM da cadeia completa
+      const certPEM = '-----BEGIN CERTIFICATE-----\n' + 
+                      cert.raw.toString('base64').match(/.{1,64}/g).join('\n') + 
+                      '\n-----END CERTIFICATE-----';
+
+      // Informações do certificado
+      const certInfo = {
+        subject: cert.subject,
+        issuer: cert.issuer,
+        validFrom: cert.valid_from,
+        validTo: cert.valid_to,
+        daysRemaining: Math.floor((new Date(cert.valid_to) - new Date()) / (1000 * 60 * 60 * 24)),
+        serialNumber: cert.serialNumber,
+        fingerprint: cert.fingerprint,
+        subjectaltname: cert.subjectaltname
+      };
+
+      resolve({ pem: certPEM, info: certInfo });
+    });
+
+    req.on('error', (err) => {
+      reject(err);
+    });
+
+    req.end();
+  });
 }
 
-const sslOptions = {
-  cert: fs.readFileSync(CERT_PATH),
-  key: fs.readFileSync(KEY_PATH)
-};
+async function obterCertificadoViaTLS() {
+  const hostname = process.env.RENDER_EXTERNAL_URL 
+    ? new URL(process.env.RENDER_EXTERNAL_URL).hostname 
+    : 'localhost';
 
-// ----------------------------------------------------------------------
-// 🔍 Função utilitária — Lê validade do certificado e informa se expira logo
-// ----------------------------------------------------------------------
-function diasParaExpirar(certPem) {
-  try {
-    const cert = forge.pki.certificateFromPem(certPem);
-    const expira = cert.validity.notAfter;
-    const diff = (expira - new Date()) / (1000 * 60 * 60 * 24);
-    return Math.floor(diff);
-  } catch (err) {
-    console.error("Erro ao ler validade do certificado:", err);
-    return 0;
-  }
+  return new Promise((resolve, reject) => {
+    const socket = tls.connect(443, hostname, { 
+      rejectUnauthorized: false,
+      servername: hostname 
+    }, () => {
+      const cert = socket.getPeerCertificate(true);
+      
+      if (!cert || Object.keys(cert).length === 0) {
+        socket.destroy();
+        reject(new Error('Certificado não encontrado'));
+        return;
+      }
+
+      const certPEM = '-----BEGIN CERTIFICATE-----\n' + 
+                      cert.raw.toString('base64').match(/.{1,64}/g).join('\n') + 
+                      '\n-----END CERTIFICATE-----';
+
+      // Informações detalhadas
+      const certInfo = {
+        subject: cert.subject,
+        issuer: cert.issuer,
+        validFrom: cert.valid_from,
+        validTo: cert.valid_to,
+        daysRemaining: Math.floor((new Date(cert.valid_to) - new Date()) / (1000 * 60 * 60 * 24)),
+        serialNumber: cert.serialNumber,
+        fingerprint: cert.fingerprint,
+        fingerprint256: cert.fingerprint256,
+        subjectaltname: cert.subjectaltname,
+        infoAccess: cert.infoAccess
+      };
+
+      socket.destroy();
+      resolve({ pem: certPEM, info: certInfo });
+    });
+
+    socket.on('error', (err) => {
+      reject(err);
+    });
+  });
 }
 
 // ----------------------------------------------------------------------
@@ -58,36 +132,87 @@ app.get("/", (req, res) => {
 
   try {
     const decoded = jwt.verify(token, process.env.TOKEN_SECRETO);
+    
     if (lockId === process.env.LOCK_ID_PERMITIDO) {
       console.log(`🔓 Fechadura autorizada: ${lockId}`);
-      return res.json({ permitido: true });
+      return res.json({ 
+        permitido: true, 
+        timestamp: new Date().toISOString() 
+      });
     } else {
       console.log(`🚫 Fechadura não reconhecida: ${lockId}`);
       return res.json({ permitido: false });
     }
-  } catch {
+  } catch (err) {
+    console.error("Erro ao verificar token:", err.message);
     return res.status(401).json({ erro: "Token inválido" });
   }
 });
 
 // ----------------------------------------------------------------------
-// 📜 Endpoint /cert — retorna o PEM atual (para o ESP baixar)
+// 📜 Endpoint /cert — retorna o certificado em formato PEM
 // ----------------------------------------------------------------------
-app.get("/cert", (req, res) => {
-  const cert = fs.readFileSync(CERT_PATH, "utf8");
-  const dias = diasParaExpirar(cert);
-
-  res.set("Content-Type", "text/plain");
-  res.send(cert);
-
-  console.log(`📤 Certificado enviado. Expira em ${dias} dias.`);
+app.get("/cert", async (req, res) => {
+  try {
+    const { pem, info } = await obterCertificadoViaTLS();
+    
+    res.set("Content-Type", "application/x-pem-file");
+    res.set("X-Cert-Expires", info.validTo);
+    res.set("X-Cert-Days-Remaining", info.daysRemaining.toString());
+    
+    console.log(`📤 Certificado enviado. Expira em ${info.daysRemaining} dias.`);
+    res.send(pem);
+    
+  } catch (error) {
+    console.error("Erro ao obter certificado:", error);
+    res.status(500).json({ 
+      erro: "Não foi possível obter o certificado",
+      detalhes: error.message 
+    });
+  }
 });
 
 // ----------------------------------------------------------------------
-// 🚀 Inicializa servidor HTTPS
+// 📊 Endpoint /certinfo — retorna informações do certificado em JSON
 // ----------------------------------------------------------------------
-const port = process.env.PORT || 443;
+app.get("/certinfo", async (req, res) => {
+  try {
+    const { pem, info } = await obterCertificadoViaTLS();
+    
+    // Adiciona o PEM ao retorno se solicitado
+    const incluirPem = req.query.pem === 'true';
+    
+    const response = {
+      info: info,
+      pemIncluded: incluirPem,
+      ...(incluirPem && { pem: pem })
+    };
+    
+    console.log(`📊 Informações do certificado enviadas. Expira em ${info.daysRemaining} dias.`);
+    res.json(response);
+    
+  } catch (error) {
+    console.error("Erro ao obter informações do certificado:", error);
+    res.status(500).json({ 
+      erro: "Não foi possível obter informações do certificado",
+      detalhes: error.message 
+    });
+  }
+});
 
-https.createServer(sslOptions, app).listen(port, () => {
-  console.log(`✅ API HTTPS rodando na porta ${port}`);
+// ----------------------------------------------------------------------
+// 🚀 Inicializa servidor HTTP (Render adiciona HTTPS automaticamente)
+// ----------------------------------------------------------------------
+const port = process.env.PORT || 3000;
+
+app.listen(port, () => {
+  console.log(`✅ API rodando na porta ${port}`);
+  console.log(`🔒 HTTPS gerenciado automaticamente pelo Render`);
+  console.log(`🌍 URL: ${process.env.RENDER_EXTERNAL_URL || 'http://localhost:' + port}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('👋 SIGTERM recebido, encerrando gracefully...');
+  process.exit(0);
 });
