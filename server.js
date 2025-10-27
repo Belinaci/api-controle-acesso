@@ -20,67 +20,45 @@ app.use(express.json());
 // Trust proxy (importante para Render)
 app.set('trust proxy', 1);
 
+/**
+ * 🔐 Middleware de Autenticação JWT
+ * Garante que apenas requisições com token válido prossigam.
+ */
+const requireAuthToken = (req, res, next) => {
+  // Tenta extrair o token do cabeçalho "Authorization: Bearer <token>"
+  const token = req.header("Authorization")?.replace("Bearer ", "");
+
+  if (!token) {
+    return res.status(401).json({ erro: "Token de autorização ausente" });
+  }
+
+  try {
+    // Verifica se o token é válido usando o segredo de ambiente
+    jwt.verify(token, process.env.TOKEN_SECRETO);
+    next(); // Token válido, pode prosseguir
+  } catch (err) {
+    console.error("Erro ao verificar token:", err.message);
+    return res.status(401).json({ erro: "Token inválido ou expirado" });
+  }
+};
+
+
 // ----------------------------------------------------------------------
-// 🔐 FUNÇÃO: Obter certificado do próprio servidor
+// 🔐 FUNÇÕES DE CERTIFICADO
 // ----------------------------------------------------------------------
-function obterCertificadoServidor() {
-  return new Promise((resolve, reject) => {
-    const hostname = process.env.RENDER_EXTERNAL_URL 
-      ? new URL(process.env.RENDER_EXTERNAL_URL).hostname 
-      : 'localhost';
-    
-    const options = {
-      host: hostname,
-      port: 443,
-      method: 'GET',
-      rejectUnauthorized: false,
-      agent: false
-    };
 
-    const req = https.request(options, (res) => {
-      const cert = res.socket.getPeerCertificate(true);
-      
-      if (!cert || Object.keys(cert).length === 0) {
-        reject(new Error('Certificado não encontrado'));
-        return;
-      }
-
-      // Extrai PEM da cadeia completa
-      const certPEM = '-----BEGIN CERTIFICATE-----\n' + 
-                      cert.raw.toString('base64').match(/.{1,64}/g).join('\n') + 
-                      '\n-----END CERTIFICATE-----';
-
-      // Informações do certificado
-      const certInfo = {
-        subject: cert.subject,
-        issuer: cert.issuer,
-        validFrom: cert.valid_from,
-        validTo: cert.valid_to,
-        daysRemaining: Math.floor((new Date(cert.valid_to) - new Date()) / (1000 * 60 * 60 * 24)),
-        serialNumber: cert.serialNumber,
-        fingerprint: cert.fingerprint,
-        subjectaltname: cert.subjectaltname
-      };
-
-      resolve({ pem: certPEM, info: certInfo });
-    });
-
-    req.on('error', (err) => {
-      reject(err);
-    });
-
-    req.end();
-  });
-}
-
+/**
+ * Obtém o certificado SSL do próprio servidor usando TLS.
+ */
 async function obterCertificadoViaTLS() {
   const hostname = process.env.RENDER_EXTERNAL_URL 
     ? new URL(process.env.RENDER_EXTERNAL_URL).hostname 
     : 'localhost';
 
   return new Promise((resolve, reject) => {
+    // Tenta conectar na porta 443 (HTTPS) para obter o certificado
     const socket = tls.connect(443, hostname, { 
-      rejectUnauthorized: false,
+      rejectUnauthorized: false, // Necessário para evitar falhas de self-signed localmente
       servername: hostname 
     }, () => {
       const cert = socket.getPeerCertificate(true);
@@ -91,6 +69,7 @@ async function obterCertificadoViaTLS() {
         return;
       }
 
+      // Converte o buffer RAW do certificado para o formato PEM (base64 com quebras de linha)
       const certPEM = '-----BEGIN CERTIFICATE-----\n' + 
                       cert.raw.toString('base64').match(/.{1,64}/g).join('\n') + 
                       '\n-----END CERTIFICATE-----';
@@ -120,39 +99,48 @@ async function obterCertificadoViaTLS() {
 }
 
 // ----------------------------------------------------------------------
-// ✅ Endpoint principal — valida permissão de abertura
+// 💚 Endpoint /health — Para manter o serviço ativo (PING/UPTIMEROBOT)
 // ----------------------------------------------------------------------
-app.get("/", (req, res) => {
-  const token = req.header("Authorization")?.replace("Bearer ", "");
+app.get("/health", (req, res) => {
+  // NÃO protegido pelo requireAuthToken. Deve ser acessível por serviços de terceiros.
+  console.log(`💚 Health Check (Ping) recebido.`);
+  res.status(200).json({ 
+    status: "ok", 
+    service: "smartlock-api",
+    uptime_seconds: process.uptime(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ----------------------------------------------------------------------
+// ✅ Endpoint principal (PROTEGIDO) — valida permissão de abertura
+// ----------------------------------------------------------------------
+// Aplica o middleware requireAuthToken
+app.get("/", requireAuthToken, (req, res) => {
   const lockId = req.header("X-Lock-ID");
 
-  if (!token || !lockId) {
-    return res.status(400).json({ erro: "Headers ausentes" });
+  if (!lockId) {
+    return res.status(400).json({ erro: "Header X-Lock-ID ausente" });
   }
 
-  try {
-    const decoded = jwt.verify(token, process.env.TOKEN_SECRETO);
-    
-    if (lockId === process.env.LOCK_ID_PERMITIDO) {
-      console.log(`🔓 Fechadura autorizada: ${lockId}`);
-      return res.json({ 
-        permitido: true, 
-        timestamp: new Date().toISOString() 
-      });
-    } else {
-      console.log(`🚫 Fechadura não reconhecida: ${lockId}`);
-      return res.json({ permitido: false });
-    }
-  } catch (err) {
-    console.error("Erro ao verificar token:", err.message);
-    return res.status(401).json({ erro: "Token inválido" });
+  // A lógica de autorização agora só precisa checar o ID da fechadura, pois o token já é válido.
+  if (lockId === process.env.LOCK_ID_PERMITIDO) {
+    console.log(`🔓 Fechadura autorizada: ${lockId}`);
+    return res.json({ 
+      permitido: true, 
+      timestamp: new Date().toISOString() 
+    });
+  } else {
+    console.log(`🚫 Fechadura não reconhecida: ${lockId}`);
+    return res.json({ permitido: false });
   }
 });
 
 // ----------------------------------------------------------------------
-// 📜 Endpoint /cert — retorna o certificado em formato PEM
+// 📜 Endpoint /cert (PROTEGIDO) — retorna o certificado em formato PEM
 // ----------------------------------------------------------------------
-app.get("/cert", async (req, res) => {
+// Aplica o middleware requireAuthToken
+app.get("/cert", requireAuthToken, async (req, res) => {
   try {
     const { pem, info } = await obterCertificadoViaTLS();
     
@@ -160,11 +148,11 @@ app.get("/cert", async (req, res) => {
     res.set("X-Cert-Expires", info.validTo);
     res.set("X-Cert-Days-Remaining", info.daysRemaining.toString());
     
-    console.log(`📤 Certificado enviado. Expira em ${info.daysRemaining} dias.`);
+    console.log(`📤 Certificado (protegido) enviado. Expira em ${info.daysRemaining} dias.`);
     res.send(pem);
     
   } catch (error) {
-    console.error("Erro ao obter certificado:", error);
+    console.error("Erro ao obter certificado:", error.message);
     res.status(500).json({ 
       erro: "Não foi possível obter o certificado",
       detalhes: error.message 
@@ -173,9 +161,10 @@ app.get("/cert", async (req, res) => {
 });
 
 // ----------------------------------------------------------------------
-// 📊 Endpoint /certinfo — retorna informações do certificado em JSON
+// 📊 Endpoint /certinfo (PROTEGIDO) — retorna informações do certificado em JSON
 // ----------------------------------------------------------------------
-app.get("/certinfo", async (req, res) => {
+// Aplica o middleware requireAuthToken
+app.get("/certinfo", requireAuthToken, async (req, res) => {
   try {
     const { pem, info } = await obterCertificadoViaTLS();
     
@@ -188,11 +177,11 @@ app.get("/certinfo", async (req, res) => {
       ...(incluirPem && { pem: pem })
     };
     
-    console.log(`📊 Informações do certificado enviadas. Expira em ${info.daysRemaining} dias.`);
+    console.log(`📊 Informações do certificado (protegidas) enviadas. Expira em ${info.daysRemaining} dias.`);
     res.json(response);
     
   } catch (error) {
-    console.error("Erro ao obter informações do certificado:", error);
+    console.error("Erro ao obter informações do certificado:", error.message);
     res.status(500).json({ 
       erro: "Não foi possível obter informações do certificado",
       detalhes: error.message 
@@ -201,7 +190,7 @@ app.get("/certinfo", async (req, res) => {
 });
 
 // ----------------------------------------------------------------------
-// 🚀 Inicializa servidor HTTP (Render adiciona HTTPS automaticamente)
+// 🚀 Inicializa servidor HTTP
 // ----------------------------------------------------------------------
 const port = process.env.PORT || 3000;
 
