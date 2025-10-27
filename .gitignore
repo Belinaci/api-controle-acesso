@@ -1,0 +1,8 @@
+/node_modules
+
+# Arquivos de log e cache
+npm-debug.log*
+.DS_Store
+
+# Variáveis de ambiente (se usar)
+.env
